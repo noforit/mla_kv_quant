@@ -1,0 +1,27 @@
+This repository contains original MLA shared-latent calibration code and local
+reference adaptations of existing quantization and evaluation methods.
+
+OSCAR
+  https://github.com/FutureMLS-Lab/OSCAR
+  MLA reference source commit: 19f85e13059de3da60686af4cbdd778b5671d9ff
+  Copyright (c) 2026 FutureMLS-Lab and the OSCAR authors.
+  License: MIT; retained in licenses/OSCAR-MIT.txt.
+  mla_quant/oscar.py preserves the MLA rotation and affine-grid INT2 arithmetic.
+
+KVarN
+  https://arxiv.org/abs/2606.03458
+  Local PyTorch adaptation in mla_quant/cache.py; content-latent cache semantics
+  differ from separate expanded K/V tensors.
+  Upstream license: Apache-2.0; retained in licenses/Apache-2.0.txt.
+
+RULER
+  https://github.com/NVIDIA/RULER
+  Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
+  License: Apache-2.0.
+  The source copyright/license header is retained in mla_quant/ruler_metrics.py.
+  The data generator is fetched as an external dependency, not vendored.
+
+lm-evaluation-harness
+  https://github.com/EleutherAI/lm-evaluation-harness
+  License: MIT; retained in licenses/lm-eval-MIT.txt.
+  The HumanEval instruction adapter follows the upstream evaluation protocol.

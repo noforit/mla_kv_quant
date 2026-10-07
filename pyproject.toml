@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mla-shared-latent-quant"
+version = "0.1.0"
+description = "Structure-aware, unit-response INT2 calibration for MLA content caches"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "torch>=2.6", "transformers==5.16.1", "accelerate>=1.0",
+  "datasets==3.6.0", "numpy", "safetensors", "tokenizers",
+  "huggingface-hub", "PyYAML", "pandas", "lm_eval[hf] @ git+https://github.com/EleutherAI/lm-evaluation-harness.git@889c656bddc5b1d5b53381d68a1ac0b5bedfec78",
+]
+
+[project.optional-dependencies]
+ruler = ["nltk", "wonderwords==2.2.0", "tenacity", "html2text", "beautifulsoup4", "requests"]
+
+[project.scripts]
+mla-prepare-data = "mla_quant.data:main"
+mla-calibrate = "mla_quant.calibrate:main"
+mla-train = "mla_quant.train:main"
+mla-evaluate = "mla_quant.evaluate:main"
+mla-ruler = "mla_quant.ruler:main"
+
+[tool.setuptools.packages.find]
+include = ["mla_quant*"]
+
+[tool.setuptools.package-data]
+mla_quant = ["tasks/*.yaml"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]

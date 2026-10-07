@@ -1,0 +1,59 @@
+{
+  "models": {
+    "deepseek": {
+      "model": "deepseek-ai/DeepSeek-V2-Lite",
+      "rotation": "artifacts/oscar/deepseek",
+      "ruler_lengths": [
+        8192,
+        16384
+      ]
+    },
+    "moonlight": {
+      "model": "moonshotai/Moonlight-16B-A3B",
+      "rotation": "artifacts/oscar/moonlight",
+      "ruler_lengths": [
+        8192
+      ]
+    },
+    "minicpm": {
+      "model": "openbmb/MiniCPM3-4B",
+      "rotation": "artifacts/oscar/minicpm",
+      "ruler_lengths": [
+        16384,
+        32768
+      ]
+    }
+  },
+  "baselines": [
+    "bf16",
+    "int2",
+    "h128",
+    "kvarn",
+    "oscar"
+  ],
+  "settings": [
+    "full_joint",
+    "kv_energy",
+    "kv_weight",
+    "cayley"
+  ],
+  "seeds": [
+    42,
+    43,
+    44
+  ],
+  "windows": [
+    "nowin",
+    "s4r8",
+    "s4r16"
+  ],
+  "tasks": [
+    "cmmlu",
+    "gsm8k",
+    "humaneval",
+    "mmlu",
+    "mbpp",
+    "triviaqa"
+  ],
+  "training_root": "runs/train"
+}
