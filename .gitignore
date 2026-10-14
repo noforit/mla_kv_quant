@@ -20,4 +20,9 @@ third_party/
 *.parquet
 *.log
 .env
+.env.*
+*.pem
+*.key
+.venv-*/
+*.zip
 .DS_Store

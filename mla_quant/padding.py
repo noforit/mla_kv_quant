@@ -1,27 +1,8 @@
-"""Out-of-tree adapter: tell the MLA KV quantizer which rows of a batch are padding.
+"""Pass lm-eval's valid row lengths to the MLA cache quantizer.
 
-Why this exists
----------------
-lm-eval's causal loglikelihood path right-pads every batch with token id ``0``
-(``pad_and_concat``) and then calls the model **without an attention mask**:
-``HFLM._model_call`` is just ``self.model(inps).logits``. Right padding is
-harmless for the *model* (pads sit after the real tokens, so a causal mask
-never lets them influence earlier logits), and harmless for per-token
-quantizers. It is **not** harmless for KVarN: its per-channel tile statistics
-cover a whole 128-token chunk, so pad rows share a chunk with the last real
-tokens and change their scales. The same prompt then quantizes differently at
-batch 1 and batch 64.
-
-This module wraps ``pad_and_concat`` — called immediately before the model
-call — to publish the exact per-row lengths, which ``mla_kv_quant`` turns into
-a row mask. Only the cache/quantizer's row selection changes: the model itself
-is still called with the same inputs and no attention mask, so nothing about
-the existing logits numerics moves except the padding-driven part we are
-fixing. The same adapter is used for KVarN tile statistics and sink/recent
-windows, where padding must not consume the recent-token budget.
-
-The generation path needs no help: ``generate`` builds and passes its own
-attention mask, which the model-forward patch reads directly.
+Padding is excluded from KVarN tile statistics and sink/recent token windows.
+The adapter preserves lm-eval's model inputs and attention behavior.
+Generation already supplies an attention mask.
 """
 
 from __future__ import annotations

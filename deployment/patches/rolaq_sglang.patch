@@ -1,0 +1,274 @@
+diff --git a/sglang-research/python/sglang/QuantKernel/mla_latent_int2.py b/sglang-research/python/sglang/QuantKernel/mla_latent_int2.py
+index 60df82c..e3355f4 100644
+--- a/sglang-research/python/sglang/QuantKernel/mla_latent_int2.py
++++ b/sglang-research/python/sglang/QuantKernel/mla_latent_int2.py
+@@ -509,7 +509,8 @@ def _assemble_rows_kernel(
+     tl.store(out_ptr + pid * OUT_D + D + ro, rv.to(out_ptr.dtype.element_ty))
+ 
+ 
+-def scatter_pack_rows(x, slots, codes_buf, params_buf, group_size, lloyd_max, bits=2):
++def scatter_pack_rows(x, slots, codes_buf, params_buf, group_size, lloyd_max, bits=2,
++                      quantizer_params=None):
+     """Quantize ``x`` (``[n, D]``, rotated frame) into ``codes/params`` at ``slots``."""
+     # Lloyd-Max here is a THREE-THRESHOLD codebook, i.e. 2-bit by construction.
+     # Running it at any other width would emit codes in 0..3 while dequant reads
+@@ -522,12 +523,19 @@ def scatter_pack_rows(x, slots, codes_buf, params_buf, group_size, lloyd_max, bi
+     if n == 0:
+         return
+     x = x.contiguous().to(torch.float32)
++    if quantizer_params is not None:
++        if not lloyd_max or bits != 2:
++            raise ValueError("Learned threshold/gain require the INT2 Lloyd writer")
++        threshold, gain = quantizer_params
++        thresholds = (-threshold, 0.0, threshold)
++    else:
++        thresholds, gain = _LM_THRESHOLDS, _LM_RATIO
+     _scatter_pack_kernel[(n,)](
+         x, slots, codes_buf, params_buf, n,
+         D=d, GS=group_size, NG=d // group_size, LLOYD=lloyd_max, BITS=bits, PF=8 // bits,
+         MASK=(1 << bits) - 1, MAXQ=float((1 << bits) - 1),
+-        T0=_LM_THRESHOLDS[0], T1=_LM_THRESHOLDS[1], T2=_LM_THRESHOLDS[2],
+-        LM_SPAN3=_LM_SPAN / 3.0, LM_RATIO=_LM_RATIO, LM_C0=_LM_CENTROIDS[0],
++        T0=thresholds[0], T1=thresholds[1], T2=thresholds[2],
++        LM_SPAN3=_LM_SPAN / 3.0, LM_RATIO=gain, LM_C0=_LM_CENTROIDS[0],
+     )
+ 
+ 
+diff --git a/sglang-research/python/sglang/srt/environ.py b/sglang-research/python/sglang/srt/environ.py
+index 6f4c16b..56004a3 100644
+--- a/sglang-research/python/sglang/srt/environ.py
++++ b/sglang-research/python/sglang/srt/environ.py
+@@ -225,6 +225,9 @@ class Envs:
+     SGLANG_OSCAR_V_ROTATION_PATH = EnvStr("")
+     # MLA / NSA latent KV INT2 fake-quant (GLM-5.1-FP8, DeepSeek-V2 style).
+     SGLANG_OSCAR_MLA_KV_ROTATION_PATH = EnvStr("")
++    SGLANG_ROLAQ_MLA_QUANTIZER_PATH = EnvStr("")
++    SGLANG_ROLAQ_MLA_ABSORB_READ_ROTATIONS = EnvBool(False)
++    SGLANG_ROLAQ_MLA_FUSED_DECODE_WRITE = EnvBool(False)
+     SGLANG_OSCAR_MLA_KV_DUMP_DIR = EnvStr("")
+     SGLANG_OSCAR_MLA_KV_DUMP_MAX_TOKENS = EnvInt(8192)
+     SGLANG_OSCAR_MLA_KV_GROUP_SIZE = EnvInt(128)
+diff --git a/sglang-research/python/sglang/srt/layers/attention/triton_backend.py b/sglang-research/python/sglang/srt/layers/attention/triton_backend.py
+index 101c38f..cffa4cc 100644
+--- a/sglang-research/python/sglang/srt/layers/attention/triton_backend.py
++++ b/sglang-research/python/sglang/srt/layers/attention/triton_backend.py
+@@ -2508,6 +2508,7 @@ class TritonAttnBackend(AttentionBackend):
+                 # this backend to speed up one pool.
+                 from sglang.srt.layers.attention.triton_ops.mla_packed_decode import (
+                     packed_mla_decode_gf_fwd,
++                    prepare_gf_splits,
+                 )
+ 
+                 ns = self.forward_metadata.num_kv_splits
+@@ -2536,8 +2537,7 @@ class TritonAttnBackend(AttentionBackend):
+                 # this one killed the very next capture -- `out=` does not look
+                 # like mutation at a glance, which is exactly why it was missed.
+                 with torch.inference_mode():
+-                    torch.clamp(ns - 1, min=1, out=ns_quant)
+-                    torch.add(ns_quant, 1, out=ns_merge)
++                    prepare_gf_splits(ns, ns_quant, ns_merge)
+                 # ns_merge is ns_quant + 1, NOT the original ns.
+                 #
+                 # They agree whenever ns >= 2, but at ns == 1 the clamp keeps
+diff --git a/sglang-research/python/sglang/srt/layers/attention/triton_ops/mla_packed_decode.py b/sglang-research/python/sglang/srt/layers/attention/triton_ops/mla_packed_decode.py
+index d23fe03..cbe1b39 100644
+--- a/sglang-research/python/sglang/srt/layers/attention/triton_ops/mla_packed_decode.py
++++ b/sglang-research/python/sglang/srt/layers/attention/triton_ops/mla_packed_decode.py
+@@ -1080,6 +1080,20 @@ def _fwd_hp_window_stage1(
+     )
+ 
+ 
++@triton.jit
++def _prepare_gf_splits_kernel(Splits,Quant,Merge,N:tl.constexpr,BLOCK:tl.constexpr):
++    offsets=tl.program_id(0)*BLOCK+tl.arange(0,BLOCK)
++    quant=tl.maximum(tl.load(Splits+offsets,mask=offsets<N,other=1)-1,1)
++    tl.store(Quant+offsets,quant,mask=offsets<N)
++    tl.store(Merge+offsets,quant+1,mask=offsets<N)
++
++
++def prepare_gf_splits(splits,quant,merge):
++    """Preserve max(splits-1,1) and its merge count with one GPU launch."""
++    _prepare_gf_splits_kernel[(triton.cdiv(splits.numel(),256),)](
++        splits,quant,merge,splits.numel(),256)
++
++
+ def _check_is_capturing() -> bool:
+     from sglang.srt.model_executor.cuda_graph_runner import get_is_capture_mode
+ 
+@@ -1178,9 +1192,14 @@ def packed_mla_decode_gf_fwd(
+     #   t.data[:, :, :2].fill_(-1.0)  ->  same RuntimeError
+     #   with torch.inference_mode(): t[...].fill_(-1.0)  ->  OK
+     _ns = max_kv_splits + 1 if has_hp else max_kv_splits
++    _clear_batch = q.shape[0]
+     with torch.inference_mode():
+-        attn_lse[:, :, :_ns].fill_(-1.0e4)
+-        attn_logits[:, :, :_ns].zero_()
++        # CUDA Graph metadata shares scratch sized for the largest captured
++        # batch. Only this graph's query rows can be read or written below.
++        # Preserve neutral empty splits for those rows without clearing the
++        # entire max-batch arena on every layer and every decode step.
++        attn_lse[:_clear_batch, :, :_ns].fill_(-1.0e4)
++        attn_logits[:_clear_batch, :, :_ns].zero_()
+ 
+     if not getattr(pool, "_gf_entry_logged", False):
+         # One line, unconditionally, the first time this path runs. The A/B
+diff --git a/sglang-research/python/sglang/srt/mem_cache/mla_packed_kv_pool.py b/sglang-research/python/sglang/srt/mem_cache/mla_packed_kv_pool.py
+index dafd9fe..6c131cf 100644
+--- a/sglang-research/python/sglang/srt/mem_cache/mla_packed_kv_pool.py
++++ b/sglang-research/python/sglang/srt/mem_cache/mla_packed_kv_pool.py
+@@ -229,6 +229,17 @@ class _PackedLatentMixin(_Int2HPMixin):
+             if rotation_layer_ids
+             else None
+         )
++        from sglang.srt.environ import envs
++        from sglang.srt.mem_cache.rolaq_mla import load_layer_quantizers
++
++        quantizer_path = envs.SGLANG_ROLAQ_MLA_QUANTIZER_PATH.get()
++        self._rolaq_fused_decode_write = envs.SGLANG_ROLAQ_MLA_FUSED_DECODE_WRITE.get()
++        if quantizer_path and (not lloyd_max or self._bits != 2):
++            raise ValueError("RoLaQ requires SGLANG_LLOYD_MAX=1 and INT2 packed storage")
++        self._rolaq_quantizers = load_layer_quantizers(
++            quantizer_path, rotation_path, group_size, self.kv_lora_rank,
++            rotation_layer_ids or list(range(self.start_layer, self.start_layer + self.layer_num)),
++        )
+         if not self.rotations:
+             raise ValueError(
+                 "Packed MLA latent storage needs a rotation path: without one "
+@@ -362,6 +373,7 @@ class _PackedLatentMixin(_Int2HPMixin):
+         # reader will use to decide whether the storage change landed.
+         self._finalize_allocation_log(self.size)
+ 
++
+     # ── accounting ──────────────────────────────────────────────────────────
+ 
+     def get_kv_size_bytes(self):
+@@ -576,6 +588,12 @@ class _PackedLatentMixin(_Int2HPMixin):
+         a cache half in each frame with nothing to catch it. The read side
+         cancels it once, on the attention output.
+         """
++        if self._rolaq_fused_decode_write:
++            from sglang.QuantKernel.mla_fused_writer import try_fast_decode_store
++
++            if try_fast_decode_store(self, layer_id, loc, c_kv, k_pe):
++                return
++
+         from sglang.QuantKernel.mla_latent_int2 import scatter_pack_rows
+ 
+         # LOCAL already: HybridLinearKVPool.set_kv_buffer remaps through
+@@ -603,6 +621,7 @@ class _PackedLatentMixin(_Int2HPMixin):
+         scatter_pack_rows(
+             c, loc64.to(torch.int32), self.c_codes[li], self.c_params[li],
+             self._group_size, self._lloyd_max, self._bits,
++            quantizer_params=self._rolaq_quantizers[li],
+         )
+         self.rope_buf[li][loc64] = pe.to(self.dtype)
+ 
+diff --git a/sglang-research/python/sglang/srt/model_executor/pool_configurator.py b/sglang-research/python/sglang/srt/model_executor/pool_configurator.py
+index 3fea7fd..c76d39d 100644
+--- a/sglang-research/python/sglang/srt/model_executor/pool_configurator.py
++++ b/sglang-research/python/sglang/srt/model_executor/pool_configurator.py
+@@ -334,6 +334,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
+                     * num_layers
+                 )
+                 # The BF16 window arena is a fixed cost, not a per-token one:
++                # hp_row_of_slot is one int32 per physical token, shared by
++                # all layers; charge it once rather than once per layer.
++                cell_size += 4
+                 # (sink + recent) rows per request slot, every layer. Charging
+                 # it here keeps the pool inside the mem-fraction budget instead
+                 # of overshooting it by a couple of GB at the end of startup.
+@@ -363,9 +366,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
+                     )
+                 self._fixed_overhead_bytes = (
+                     (1 + max_reqs * (p + r))
+-                    * model_config.kv_lora_rank
+-                    * 2
+-                    * num_layers
++                    * (model_config.kv_lora_rank * 2 * num_layers + 4)
+                 )
+             else:
+                 cell_size = (
+diff --git a/sglang-research/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py b/sglang-research/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+index 824f2f6..75dd162 100644
+--- a/sglang-research/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
++++ b/sglang-research/python/sglang/srt/models/deepseek_common/attention_forward_methods/forward_mla.py
+@@ -455,6 +455,7 @@ class DeepseekMLAForwardMixin:
+                 )
+         else:
+             _packed = None
++            _skip_unused_decode_inputs = False
+             if _use_aiter_gfx95:
+                 cos = self.rotary_emb.cos_cache
+                 sin = self.rotary_emb.sin_cache
+@@ -482,7 +483,15 @@ class DeepseekMLAForwardMixin:
+ 
+                 save_kv_cache = False
+             else:
+-                q = torch.cat([q_nope_out, q_pe], dim=-1)
++                _packed = _packed_latent_pool(forward_batch, self.attn_mqa.layer_id)
++                _skip_unused_decode_inputs = (
++                    _packed is not None
++                    and forward_batch.forward_mode.is_decode_or_idle()
++                    and getattr(forward_batch.attn_backend, "packed_mla_pool", False)
++                )
++                # Packed Triton decode reads K/V from the pool after the write
++                # below. Build its query once, after any required read rotation.
++                q = None if _skip_unused_decode_inputs else torch.cat([q_nope_out, q_pe], dim=-1)
+                 k = torch.cat([k_nope, k_pe], dim=-1)
+ 
+             # Packed-INT2 latent: the cache holds the *rotated* latent, because
+@@ -506,11 +515,15 @@ class DeepseekMLAForwardMixin:
+                 _lid = self.attn_mqa.layer_id
+                 _packed.set_kv_buffer(self.attn_mqa, forward_batch.out_cache_loc, k, k_nope)
+                 save_kv_cache = False
+-                k_nope = _packed.rotate_latent(_lid, k_nope)
++                if not _skip_unused_decode_inputs:
++                    k_nope = _packed.rotate_latent(_lid, k_nope)
++                if not getattr(self, "rolaq_read_rotations_absorbed", False):
++                    q_nope_out = _packed.rotate_latent(_lid, q_nope_out)
+                 q = torch.cat(
+-                    [_packed.rotate_latent(_lid, q_nope_out), q_pe], dim=-1
++                    [q_nope_out, q_pe], dim=-1
+                 )
+-                k = torch.cat([k_nope, k_pe], dim=-1)
++                if not _skip_unused_decode_inputs:
++                    k = torch.cat([k_nope, k_pe], dim=-1)
+ 
+             # Apply llama 4 scaling if provided
+             if llama_4_scaling is not None:
+@@ -524,7 +537,7 @@ class DeepseekMLAForwardMixin:
+                 save_kv_cache=save_kv_cache,
+                 **(dict(topk_indices=topk_indices) if topk_indices is not None else {}),
+             )
+-            if _packed is not None:
++            if _packed is not None and not getattr(self, "rolaq_read_rotations_absorbed", False):
+                 attn_output = _packed.unrotate_output(
+                     self.attn_mqa.layer_id,
+                     attn_output.view(-1, self.num_local_heads, self.kv_lora_rank),
+@@ -743,4 +756,3 @@ def _trace_attn_out(mod, tag: str, t) -> None:
+         )
+     except Exception:  # noqa: BLE001
+         pass
+-
+diff --git a/sglang-research/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py b/sglang-research/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+index b72e829..8279899 100644
+--- a/sglang-research/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
++++ b/sglang-research/python/sglang/srt/models/deepseek_common/deepseek_weight_loader.py
+@@ -552,6 +552,17 @@ class DeepseekV2WeightLoaderMixin:
+                         torch.bfloat16
+                     )
+ 
++            if envs.SGLANG_ROLAQ_MLA_ABSORB_READ_ROTATIONS.get():
++                if not envs.SGLANG_OSCAR_MLA_KV_PACKED.get():
++                    raise ValueError("Read-rotation absorption requires packed MLA")
++                if use_deep_gemm_bmm or self.quant_config is not None:
++                    raise ValueError("Read-rotation absorption currently requires BF16 model weights")
++                from sglang.srt.mem_cache.rolaq_mla import fold_read_rotation
++                w = fold_read_rotation(
++                    w, layer_id, envs.SGLANG_OSCAR_MLA_KV_ROTATION_PATH.get()
++                )
++                self_attn.rolaq_read_rotations_absorbed = True
++
+             w_kc, w_vc = w.unflatten(
+                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
+             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)

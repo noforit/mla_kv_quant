@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "mla-shared-latent-quant"
-version = "0.1.0"
-description = "Structure-aware, unit-response INT2 calibration for MLA content caches"
+name = "rolaq"
+version = "0.2.0"
+description = "Joint rotation and range calibration for 2-bit MLA KV caches"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -16,6 +16,9 @@ dependencies = [
 
 [project.optional-dependencies]
 ruler = ["nltk", "wonderwords==2.2.0", "tenacity", "html2text", "beautifulsoup4", "requests"]
+
+[project.urls]
+Repository = "https://github.com/noforit/RoLaQ"
 
 [project.scripts]
 mla-prepare-data = "mla_quant.data:main"

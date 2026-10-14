@@ -1,114 +1,158 @@
-# Shared-Latent INT2 Quantization for MLA
+# RoLaQ
 
-Research code for quantizing the **shared content latent** in Multi-head Latent Attention (MLA). The model weights remain frozen; each layer learns one shared orthogonal rotation and an INT2 threshold. The default **κ = 1** rule couples reconstruction gain to the threshold. RoPE keys remain BF16.
+**Joint Rotation and Range Calibration for 2-Bit KV Caches in Multi-Head Latent Attention**
 
-## Methods
+RoLaQ jointly calibrates a shared rotation and per-layer quantization ranges for
+2-bit MLA content caches. It uses joint key/value geometry (`H_K + H_V`) and
+combines prediction KL with attention-output loss. Model weights and positional
+keys remain BF16.
 
-| Setting | Training option |
-|---|---|
-| Full joint | `--setting full_joint` |
-| K/V aggregate-energy subspaces (`H_K + H_V`) | `--setting kv_energy` |
-| K/V signed-contrast subspaces (`H_K − H_V`) | `--setting kv_weight` |
-| Cayley | `--setting cayley` |
-
-All four settings use the same training pipeline and one reconstructed latent for both K and V. `--gain-mode unit` is the default; `--gain-mode free` enables the free-gain comparison.
-
-Evaluation supports **BF16, unrotated INT2, H128, KVarN, OSCAR, and our learned method**. The target models are DeepSeek-V2-Lite, Moonlight-16B-A3B, and MiniCPM3-4B.
+This repository includes calibration, downstream benchmarks, RULER retrieval,
+and SGLang serving with packed INT2 caches.
 
 ## Installation
 
-Python 3.10+ and a CUDA GPU are recommended. The package pins the native MLA support in Transformers 5.16.1 and the project's lm-evaluation-harness revision.
+Use Linux, Python 3.12, and a CUDA GPU.
+Keep calibration/evaluation and SGLang in separate Conda environments because
+they use different PyTorch and Transformers versions.
 
 ```bash
+git clone https://github.com/noforit/RoLaQ.git
+cd RoLaQ
+conda create -n rolaq-hf python=3.12 -y
+conda activate rolaq-hf
+python -m pip install --upgrade pip
 python -m pip install -e .
 python -m pip install flash-attn==2.8.3.post1 --no-build-isolation
 ```
 
-`--model` accepts a local checkpoint directory, a Hugging Face ID, or the aliases `deepseek`, `moonlight`, and `minicpm`.
+FlashAttention requires a CUDA toolkit compatible with the installed PyTorch.
 
-## Prepare data and train
+Supported models: DeepSeek-V2-Lite, Moonlight-16B-A3B, and MiniCPM3-4B.
+Commands accept a local checkpoint, a Hugging Face ID, or the corresponding
+alias (`deepseek`, `moonlight`, `minicpm`). The examples below use DeepSeek-V2-Lite.
 
-Supply a training-corpus JSONL file with a `text` field. The helper creates disjoint rotation, training, and validation splits.
+## Calibration
+
+Download a checkpoint and prepare disjoint initialization, training, and
+validation data:
 
 ```bash
-mla-prepare-data --model deepseek \
-  --input-jsonl /path/to/train.jsonl --output data/deepseek
+hf download deepseek-ai/DeepSeek-V2-Lite --local-dir models/deepseek
 
-mla-calibrate --model deepseek --data data/deepseek/rotation.json \
-  --output artifacts/oscar/deepseek
+mla-prepare-data --model models/deepseek \
+  --dataset monology/pile-uncopyrighted \
+  --dataset-revision 3be90335b66f24456a5d6659d9c8d208c0357119 \
+  --output data/deepseek
+```
 
-CUDA_VISIBLE_DEVICES=0 mla-train --model deepseek \
+For a local corpus, use `--input-jsonl corpus.jsonl` with a `text` field.
+
+Initialize the shared rotations and jointly calibrate rotation and range:
+
+```bash
+CUDA_VISIBLE_DEVICES=0 mla-calibrate --model models/deepseek \
+  --data data/deepseek/rotation.json --output artifacts/initial/deepseek
+
+CUDA_VISIBLE_DEVICES=0 mla-train --model models/deepseek \
   --train-data data/deepseek/train.json \
   --validation-data data/deepseek/validation.json \
-  --rotation-dir artifacts/oscar/deepseek \
-  --setting kv_energy --seed 42 \
-  --output runs/train/deepseek/kv_energy/seed42
+  --rotation-dir artifacts/initial/deepseek \
+  --seed 42 --output runs/deepseek
 ```
 
-An existing compatible OSCAR rotation directory can replace the calibration step. Training exports a loadable `artifact/` and records its validation-based checkpoint selection.
+The final artifact is saved to `runs/deepseek/artifact/` and contains each
+layer's calibrated rotation and quantizer parameters. Use it for evaluation
+and deployment. Data preparation and training require new output directories.
 
-Train all four settings with seeds 42/43/44:
+## Evaluation
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 bash scripts/train_all.sh \
-  deepseek data/deepseek artifacts/oscar/deepseek runs/train/deepseek
+CUDA_VISIBLE_DEVICES=0 mla-evaluate --model models/deepseek \
+  --method rolaq --artifact runs/deepseek/artifact \
+  --window s4r16 --output results/deepseek
 ```
 
-## Main-table evaluation
+The suite covers MMLU, CMMLU, TriviaQA, GSM8K, HumanEval, and MBPP with fixed
+few-shot settings. Task scores and their mean are saved to `scores.json`.
+HumanEval and MBPP run generated Python using lm-eval's code-evaluation backend.
 
-The six tasks are CMMLU, GSM8K, HumanEval, MMLU, MBPP, and TriviaQA.
+Use `--tasks gsm8k` to select a task, `--batch-size 8` to set the batch size, or
+`--resume` to continue an interrupted run. `s4r16` preserves four initial and
+sixteen recent tokens in BF16; `--window nowin` disables token protection.
+HF evaluation uses quantize–dequantize caches to compare accuracy across methods.
 
-```bash
-mla-evaluate --model deepseek --method ours \
-  --artifact runs/train/deepseek/kv_energy/seed42/artifact \
-  --window s4r16 --output results/example
-```
+For baselines, set `--method` to `bf16`, `int2`, `h128`, `kvarn`, or `oscar`.
+BF16 needs no artifact; OSCAR uses the initialization artifact.
 
-Use `--method bf16`, `int2`, `h128`, `kvarn`, or `oscar` for baselines. OSCAR needs `--artifact artifacts/oscar/deepseek`. Available protection policies are `nowin`, `s4r8`, and `s4r16`.
+## RULER retrieval
 
-Edit model/artifact paths in `configs/main_table.json`, then run the full matrix:
-
-```bash
-python scripts/run_matrix.py --suite main --gpus 0 1 --output results
-python scripts/collect_results.py --suite main --root results \
-  --output results/main_summary.json
-```
-
-## RULER
-
-Prepare upstream RULER data for each model tokenizer:
+Prepare the data and run RULER retrieval evaluation:
 
 ```bash
 python -m pip install -e '.[ruler]'
 python -m nltk.downloader punkt punkt_tab
-python scripts/prepare_ruler.py --model deepseek \
-  --output data/ruler/deepseek --lengths 8192 16384
+
+python scripts/prepare_ruler.py --model models/deepseek \
+  --output data/ruler/deepseek --lengths 16384 --samples 100
+
+CUDA_VISIBLE_DEVICES=0 mla-ruler --model models/deepseek \
+  --method rolaq --artifact runs/deepseek/artifact \
+  --data-root data/ruler/deepseek/16384 --window s4r16 \
+  --batch-size 8 --output results/ruler_deepseek
 ```
 
-For MiniCPM3, use `--template minicpm3-chat`. The generator downloads its external data on the first run.
+Use `--lengths 8192` for Moonlight. For MiniCPM, add `--template minicpm3-chat`
+during data preparation. Reduce `--batch-size` or use `--prefill-chunk-tokens 2048`
+if GPU memory is limited. Predictions and scores are saved in the output
+directory, with a summary in `summary.json`.
+
+## SGLang deployment
+
+SGLang deployment supports DeepSeek-V2-Lite on one GPU, using packed INT2
+content caches with BF16 positional keys and protected tokens.
 
 ```bash
-mla-ruler --model deepseek --method ours \
-  --artifact runs/train/deepseek/kv_energy/seed42/artifact \
-  --data-root data/ruler/deepseek/8192 --window s4r16 \
-  --output results/ruler_example
+conda create -n rolaq-serve python=3.12 -y
+conda activate rolaq-serve
+python -m pip install --upgrade pip
+python deployment/install.py
 
-python scripts/run_matrix.py --suite ruler --data-root data/ruler \
-  --gpus 0 1 --output results
-python scripts/collect_results.py --suite ruler --root results \
-  --output results/ruler_summary.json
+python deployment/serve.py \
+  --model models/deepseek --artifact runs/deepseek/artifact \
+  --gpu 0 --port 30000 --context-length 16384
 ```
 
-Each RULER run covers 13 tasks. Matrix runs use one process per selected GPU and resume existing cells. Partial runs made with `--limit` are excluded from the result collector.
+The installer downloads and patches the OSCAR/SGLang base in
+`third_party/OSCAR` and installs the serving dependencies. Choose an idle GPU
+and use the artifact calibrated for the same checkpoint.
 
-## Code layout
+Send a generation request:
 
-- `mla_quant/geometry.py`: the four shared rotation settings.
-- `mla_quant/quantizer.py` and `train.py`: INT2 calibration and artifact export.
-- `mla_quant/cache.py` and `oscar.py`: MLA cache integration and baselines.
-- `mla_quant/evaluate.py` and `ruler.py`: benchmark entry points.
-- `scripts/` and `configs/`: training and evaluation matrices.
+```bash
+curl http://127.0.0.1:30000/generate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"The capital of France is","sampling_params":{"temperature":0,"max_new_tokens":32}}'
+```
 
-This is a quantize–dequantize implementation for accuracy evaluation. Exact reproduction of archived results requires the original calibration data, rotations, and selected artifacts. The portable trainer uses domain-averaged validation KL for checkpoint selection. For MiniCPM3, use the same rotary configuration as the results being reproduced.
+Use `--method bf16` without `--artifact` to serve a BF16 reference. The server
+runs in the foreground; stop it with Ctrl-C.
 
-Original code is licensed under Apache-2.0. We thank [OSCAR](https://github.com/FutureMLS-Lab/OSCAR), [QuaRot](https://github.com/spcl/QuaRot), [KVarN](https://arxiv.org/abs/2606.03458), [lm-evaluation-harness](https://github.com/EleutherAI/lm-evaluation-harness), and [RULER](https://github.com/NVIDIA/RULER). Third-party notices are retained in `NOTICE` and `licenses/`.
+## Repository layout
+
+```text
+mla_quant/             calibration, artifact export, quantization, and evaluation
+mla_quant/tasks/       HumanEval and MBPP evaluation adapters
+scripts/prepare_ruler.py
+                       RULER retrieval data preparation
+deployment/install.py  pinned SGLang installation
+deployment/serve.py    native INT2 server launcher
+deployment/sglang/     RoLaQ parameter loader and fused INT2 writer
+deployment/patches/    integration with the packed cache and attention readers
+```
+
+## License
+
+Original code is licensed under Apache-2.0. Third-party notices and licenses for
+OSCAR, SGLang, KVarN, RULER, and lm-evaluation-harness are retained in `NOTICE`
+and `licenses/`.

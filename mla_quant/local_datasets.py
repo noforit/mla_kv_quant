@@ -6,7 +6,6 @@ from pathlib import Path
 from typing import Any
 
 _ORIGINAL_LOAD_DATASET: Any | None = None
-_ORIGINAL_TASK_MANAGER_INIT: Any | None = None
 
 
 def install_local_cmmlu_patch(data_dir: str | Path) -> Path:
@@ -76,20 +75,7 @@ def uninstall_local_cmmlu_patch() -> None:
     _ORIGINAL_LOAD_DATASET = None
 
 
-def uninstall_task_path_only_patch() -> None:
-    """Restore TaskManager discovery patched by install_task_path_only_patch."""
-    global _ORIGINAL_TASK_MANAGER_INIT
-    if _ORIGINAL_TASK_MANAGER_INIT is None:
-        return
-    from lm_eval.tasks import TaskManager
-
-    TaskManager.__init__ = _ORIGINAL_TASK_MANAGER_INIT
-    _ORIGINAL_TASK_MANAGER_INIT = None
-
-
 __all__ = [
     "install_local_cmmlu_patch",
-    "install_task_path_only_patch",
     "uninstall_local_cmmlu_patch",
-    "uninstall_task_path_only_patch",
 ]

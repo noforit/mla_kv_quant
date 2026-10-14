@@ -1,15 +1,4 @@
-# HumanEval for chat/instruct models, with continuation-indent normalisation.
-#
-# Identical prompt/stop-token configuration to lm-eval's `humaneval_instruct`
-# (doc_to_text, gen_prefix, until, max_gen_toks) so generations stay
-# comparable, but the response -> program conversion fixes the first-line
-# body indent before concatenating it with the task prompt.
-#
-# Why: MiniCPM3-4B (chat template, gen_prefix continuation) emits its first
-# code line with 3 leading spaces instead of the 4 implied by the prompt's
-# body block.  The stock `build_predictions_instruct` concatenates verbatim,
-# producing `IndentationError` unless the first line happens to be a comment
-# (72/104 failures on the BF16 reference run were this artefact).
+# HumanEval chat continuation adapter; preserve the upstream prompt and stops.
 task: humaneval_instruct_norm
 dataset_path: openai/openai_humaneval
 unsafe_code: true

@@ -1,4 +1,4 @@
-"""Small local helpers for immutable experiment outputs and fingerprints."""
+"""Artifact export, model fingerprints, and atomic metadata writes."""
 
 from __future__ import annotations
 import hashlib
@@ -31,18 +31,6 @@ def atomic_write_json(path: str | Path, value) -> None:
     finally:
         if os.path.exists(temporary):
             os.unlink(temporary)
-
-
-def reserve_candidate(path: str | Path) -> Path:
-    """Claim a fresh candidate directory before expensive training starts.
-
-    Failed runs leave the directory in place. Choose a new run name; never
-    silently delete a historical checkpoint or guess whether it was partial.
-    """
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.mkdir(exist_ok=False)
-    return path
 
 
 def freeze_backbone(model):

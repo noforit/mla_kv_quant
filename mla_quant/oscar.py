@@ -23,12 +23,6 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def json_hash(value: Any) -> str:
-    return hashlib.sha256(
-        json.dumps(value, sort_keys=True, ensure_ascii=False).encode()
-    ).hexdigest()
-
-
 def checkpoint_identity(model_path: str | Path) -> dict[str, Any]:
     """Identify the local checkpoint, allowing filesystem aliases, not other weights.
 
@@ -42,7 +36,7 @@ def checkpoint_identity(model_path: str | Path) -> dict[str, Any]:
     config = json.loads(config_path.read_text())
     index = root / "model.safetensors.index.json"
     return {
-        "path": str(root),
+        "checkpoint_name": root.name,
         "config_sha256": sha256_file(config_path),
         "weight_index_sha256": sha256_file(index) if index.exists() else None,
         **{key: config.get(key) for key in CONFIG_FIELDS},
@@ -129,11 +123,9 @@ def oscar_lloyd_int2_qdq(
     threshold: float = LLOYD_MAX_THRESHOLDS[-1],
     gain: float = LLOYD_MAX_STRETCH,
 ) -> torch.Tensor:
-    """Pinned upstream MLA Lloyd branch, including its AFFINE reconstruction.
+    """Pinned upstream MLA Lloyd quantization with affine reconstruction.
 
     Source: commit SOURCE_COMMIT, mla_int2_kv_pool._fake_quant_int2_groupwise.
-    The historical project `lloyd_up` reconstructed nonuniform centroids; that
-    implementation is preserved under `lloyd_up_legacy` after the baseline fix.
     """
     shape = values.shape
     groups = values.reshape(-1, group_size).float()
@@ -377,12 +369,8 @@ class OscarMLAQuantizer:
             "int2_recipe_version": 2,
             "lloyd_reconstruction": (
                 "official_mla_affine_ratio_1.16"
-                if self.int2_mode in {"lloyd_up", "oscar_lloyd_up"}
-                else (
-                    "legacy_centroid_ratio_1.16"
-                    if self.int2_mode == "lloyd_up_legacy"
-                    else "not_upstream_lloyd_up"
-                )
+                if self.int2_mode == "lloyd_up"
+                else "uniform_affine"
             ),
             "rotation_dir": str(self.root),
             "manifest_sha256": self.manifest_sha256,

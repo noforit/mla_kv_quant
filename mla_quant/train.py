@@ -10,11 +10,12 @@ from torch import nn
 from .artifacts import atomic_write_json, freeze_backbone, assert_frozen_backbone
 from .common import resolve_model, seed_everything
 from .data import read_data, batches
-from .geometry import SETTINGS, SharedRotation
+from .geometry import SharedRotation
 from .numerics import configure_reference_numerics
 from .objectives import forward_hidden, projected_kl, mla_output_loss
 from .oscar import OscarMLAQuantizer, LLOYD_MAX_THRESHOLDS, OSCAR_LLOYD_CENTERS, sha256_file
 from .quantizer import rotate_quantize, write_learned_artifact, LearnedRotationQuantizer
+from .selection import long_views, select_candidate
 
 
 def signal_response(threshold):
@@ -40,7 +41,7 @@ def threshold_upper_bound():
 
 
 def validate(model, views, quantize, reference, chunk_size):
-    """Teacher-forced continuation KL; geometry selection never uses task scores."""
+    """Teacher-forced continuation KL relative to the initialization."""
     totals = {}
     scale = float(getattr(model.config, "logits_scaling", 1.0) or 1.0)
     with torch.no_grad():
@@ -81,6 +82,7 @@ def train(args):
     tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=False)
     views, _ = read_data(args.train_data, tokenizer)
     validation, _ = read_data(args.validation_data, tokenizer, tail=96)
+    long_validation = long_views(validation, tokenizer.eos_token_id)
     training_sources = {v.item.get("source_sha256") for v in views}
     validation_sources = {v.item.get("source_sha256") for v in validation}
     if (training_sources & validation_sources) - {None}:
@@ -110,18 +112,13 @@ def train(args):
     reference.validate_config(model.config)
     rotations = nn.ModuleList(
         [
-            SharedRotation(reference.rotations[i].to(args.device), args.setting, layer.self_attn)
+            SharedRotation(reference.rotations[i].to(args.device), layer.self_attn)
             for i, layer in enumerate(model.model.layers)
         ]
     )
     count = len(rotations)
     threshold = nn.Parameter(torch.full((count,), LLOYD_MAX_THRESHOLDS[-1], device=args.device))
-    free_gain = (
-        nn.Parameter(torch.full((count,), 1.16, device=args.device))
-        if args.gain_mode == "free"
-        else None
-    )
-    quant_params = [threshold] + ([free_gain] if free_gain is not None else [])
+    quant_params = [threshold]
     optimizer = torch.optim.Adam(
         [
             {"params": rotations.parameters(), "lr": args.lr_rotation},
@@ -129,7 +126,7 @@ def train(args):
         ]
     )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=len(schedule))
-    upper = 1.5 if free_gain is not None else threshold_upper_bound()
+    upper = threshold_upper_bound()
     scale = float(getattr(model.config, "logits_scaling", 1.0) or 1.0)
     numerics = configure_reference_numerics()
     config = {
@@ -142,7 +139,7 @@ def train(args):
         "numerical_backend": numerics,
     }
     atomic_write_json(out / "run_config.json", config)
-    gain = lambda: free_gain if free_gain is not None else signal_gain(threshold)
+    gain = lambda: signal_gain(threshold)
 
     def callback(matrices, temperature=0.1):
         gains = gain()
@@ -157,10 +154,10 @@ def train(args):
         )
 
     baseline = lambda i, x: reference.quantize_layer(x, i, "nope")
-    started, best, events = time.time(), float("inf"), []
+    started, events = time.time(), []
+    retained = {}
 
     def evaluate(step):
-        nonlocal best
         matrices = [r() for r in rotations]
         score, domains = validate(
             model, validation, callback(matrices), baseline, args.kl_chunk_size
@@ -170,8 +167,11 @@ def train(args):
         record = {"step": step, "validation_ratio": score, "domains": domains}
         events.append(record)
         atomic_write_json(out / "validation.json", events)
-        if score < best:
-            best = score
+        retained[step] = record
+        keep = set(
+            sorted(retained, key=lambda key: (retained[key]["validation_ratio"], key))[:2]
+        ) | {0}
+        if step in keep:
             torch.save(
                 {
                     "step": step,
@@ -180,8 +180,12 @@ def train(args):
                     "threshold": threshold.detach().cpu(),
                     "gain": gain().detach().cpu(),
                 },
-                out / "best.pt",
+                out / f"candidate_{step}.pt",
             )
+        for old_step in list(retained):
+            if old_step not in keep:
+                retained.pop(old_step)
+                (out / f"candidate_{old_step}.pt").unlink(missing_ok=True)
         print(json.dumps(record), flush=True)
 
     evaluate(0)
@@ -230,8 +234,6 @@ def train(args):
             scheduler.step()
             with torch.no_grad():
                 threshold.clamp_(0.5, upper)
-                if free_gain is not None:
-                    free_gain.clamp_(0.8, 1.3)
             assert_frozen_backbone(model)
             row = {"step": step, **losses, "elapsed_seconds": time.time() - started}
             log.write(json.dumps(row) + "\n")
@@ -240,15 +242,48 @@ def train(args):
             if step % args.eval_every == 0 or step == len(schedule):
                 evaluate(step)
 
-    state = torch.load(out / "best.pt", map_location="cpu", weights_only=True)
+    candidates = []
+    for candidate_step, record in sorted(retained.items()):
+        state = torch.load(
+            out / f"candidate_{candidate_step}.pt", map_location="cpu", weights_only=True
+        )
+        matrices = [matrix.to(args.device) for matrix in state["rotations"]]
+        frozen_t, frozen_g = state["threshold"].to(args.device), state["gain"].to(args.device)
+
+        def frozen_callback(i, x):
+            return rotate_quantize(x, matrices[i], 128, "oscar_lloyd", frozen_t[i], frozen_g[i])
+
+        row = {
+            "step": candidate_step,
+            "short_ratio": record["validation_ratio"],
+            "worst_domain_ratio": max(d["ratio"] for d in record["domains"].values()),
+        }
+        for length, views in long_validation.items():
+            row[f"ratio_{length // 1024}k"] = validate(
+                model, views, frozen_callback, baseline, args.kl_chunk_size
+            )[0]
+        candidates.append(row)
+    selected = select_candidate(candidates)
+    atomic_write_json(
+        out / "selection.json",
+        {
+            "candidates": candidates,
+            "selected": selected,
+            "rule": "min S among eligible retained checkpoints; ties prefer fewer steps",
+        },
+    )
+    state = torch.load(
+        out / f"candidate_{selected['step']}.pt", map_location="cpu", weights_only=True
+    )
     calibration = {
         "seed": args.seed,
-        "setting": args.setting,
-        "signal_coefficient": 1.0 if args.gain_mode == "unit" else None,
-        "gain_rule": "1/C(T)" if args.gain_mode == "unit" else "learned",
+        "setting": "kv_energy",
+        "signal_coefficient": 1.0,
+        "gain_rule": "kappa_over_gaussian_response_C(T)",
         "numerical_backend": numerics,
         "selected_step": state["step"],
         "validation_ratio": state["score"],
+        "selection_S": selected["S"],
         "data_sha256": config["train_data_sha256"],
     }
     write_learned_artifact(
@@ -269,6 +304,10 @@ def train(args):
         {
             "selected_step": state["step"],
             "validation_ratio": state["score"],
+            "selection_S": selected["S"],
+            "input_tokens": config["input_tokens"],
+            "updates": len(schedule),
+            "partial": args.steps is not None,
             "elapsed_seconds": time.time() - started,
             "artifact": "artifact",
             "layers": count,
@@ -281,8 +320,6 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for name in ("model", "train-data", "validation-data", "rotation-dir", "output"):
         parser.add_argument("--" + name, required=True)
-    parser.add_argument("--setting", choices=SETTINGS, default="kv_energy")
-    parser.add_argument("--gain-mode", choices=("unit", "free"), default="unit")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--batch-order-seed", type=int)
     parser.add_argument("--input-token-budget", type=int, default=1430800)

@@ -1,4 +1,4 @@
-"""Evaluate the 13 RULER tasks from upstream-generated validation JSONL files."""
+"""Evaluate the eight RULER retrieval tasks from upstream-generated JSONL."""
 
 import argparse
 import json
@@ -8,12 +8,10 @@ import torch
 from .common import METHODS, WINDOWS, resolve_model, install_method, seed_everything
 from .artifacts import atomic_write_json
 from .prefill import _generate_with_chunked_prefill
-from .ruler_metrics import string_match_all, string_match_part
+from .ruler_metrics import string_match_all
 from . import cache
 
 MAX_NEW = {
-    "cwe": 120,
-    "fwe": 50,
     "niah_multikey_1": 128,
     "niah_multikey_2": 128,
     "niah_multikey_3": 128,
@@ -22,15 +20,15 @@ MAX_NEW = {
     "niah_single_1": 128,
     "niah_single_2": 128,
     "niah_single_3": 128,
-    "qa_1": 32,
-    "qa_2": 32,
-    "vt": 30,
 }
 
 
 def generate(model, tokenizer, rows, maximum, prefill_chunk):
     encoded = tokenizer(
-        [r["input"] for r in rows], return_tensors="pt", padding=True, add_special_tokens=True
+        [r["input"] + r.get("answer_prefix", "") for r in rows],
+        return_tensors="pt",
+        padding=True,
+        add_special_tokens=True,
     )
     encoded = {k: v.to(next(model.parameters()).device) for k, v in encoded.items()}
     length = encoded["input_ids"].shape[1]
@@ -109,7 +107,13 @@ def evaluate(args):
                 if record["_id"] in completed:
                     raise ValueError("duplicate prediction ID in resume file")
                 completed[record["_id"]] = record
-        if any(i >= len(rows) or r["input"] != rows[i]["input"] for i, r in completed.items()):
+        if any(
+            i < 0
+            or i >= len(rows)
+            or r["input"] != rows[i]["input"]
+            or r.get("answer_prefix", "") != rows[i].get("answer_prefix", "")
+            for i, r in completed.items()
+        ):
             raise ValueError("saved predictions do not match the current RULER input")
         pending = sorted(
             [r for r in rows if r["_id"] not in completed],
@@ -129,6 +133,7 @@ def evaluate(args):
                     record = {
                         "_id": row["_id"],
                         "input": row["input"],
+                        "answer_prefix": row.get("answer_prefix", ""),
                         "pred": prediction,
                         "answers": answers,
                         "length": row.get("length"),
@@ -136,7 +141,7 @@ def evaluate(args):
                     handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                     completed[row["_id"]] = record
                 handle.flush()
-        metric = string_match_part if task.startswith("qa_") else string_match_all
+        metric = string_match_all
         ordered = [completed[i] for i in range(len(rows))]
         scores[task] = {
             "score": metric([r["pred"].strip() for r in ordered], [r["answers"] for r in ordered]),
@@ -146,6 +151,7 @@ def evaluate(args):
         atomic_write_json(root / "scores.json", scores)
         print(json.dumps({task: scores[task]}), flush=True)
     summary = {
+        "suite": "ruler_retrieval_8",
         "tasks": scores,
         "complete_suite": set(scores) == set(MAX_NEW),
         "partial": args.limit is not None,
@@ -179,7 +185,11 @@ def main():
     )
     parser.add_argument("--resume", action="store_true")
     args = parser.parse_args()
-    if args.batch_size < 1 or (args.limit is not None and args.limit < 1):
+    if (
+        args.batch_size < 1
+        or (args.limit is not None and args.limit < 1)
+        or args.prefill_chunk_tokens < 0
+    ):
         parser.error("batch-size and limit must be positive")
     evaluate(args)
 

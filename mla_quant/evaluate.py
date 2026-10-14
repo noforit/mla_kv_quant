@@ -1,4 +1,4 @@
-"""One main-table cell or the six-task suite with a common cache policy."""
+"""Evaluate the six downstream benchmarks with a common cache policy."""
 
 import argparse
 import json
@@ -9,11 +9,17 @@ from . import cache
 from .padding import install_pad_mask_patch
 
 TASKS = {"cmmlu": 5, "gsm8k": 5, "humaneval": 0, "mmlu": 5, "mbpp": 3, "triviaqa": 5}
+BATCH = {
+    "deepseek_v2": dict(cmmlu=64, gsm8k=32, humaneval=16, mmlu=16, mbpp=16, triviaqa=64),
+    "deepseek_v3": dict(cmmlu=64, gsm8k=32, humaneval=16, mmlu=16, mbpp=16, triviaqa=64),
+    "minicpm3": dict(cmmlu=64, gsm8k=64, humaneval=32, mmlu=32, mbpp=64, triviaqa=64),
+}
 
 
 def metric(result, task):
     if task in ("cmmlu", "mmlu"):
-        return result["groups"][task]["acc,none"] * 100
+        group = result.get("groups", {}).get(task) or result["results"][task]
+        return group["acc,none"] * 100
     values = result["results"][
         (
             task
@@ -35,11 +41,14 @@ def metric(result, task):
 
 
 def evaluate(args):
+    import datasets
     from transformers import AutoConfig
     from lm_eval import simple_evaluate
     from lm_eval.tasks import TaskManager
     import lm_eval
 
+    # The pinned CMMLU task uses the public dataset's Python loading script.
+    datasets.config.HF_DATASETS_TRUST_REMOTE_CODE = True
     seed_everything(args.seed)
     model_path = resolve_model(args.model)
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=False)
@@ -61,6 +70,9 @@ def evaluate(args):
         "limit": args.limit,
         "chat_template": chat,
         "tasks": args.tasks,
+        "attention_backend": args.attention_backend,
+        "cmmlu_data": args.cmmlu_data,
+        "mbpp_stop_sequences": ["[DONE]", "[END]"],
     }
     if args.resume:
         if json.loads((root / "run_config.json").read_text()) != atomic:
@@ -75,7 +87,7 @@ def evaluate(args):
     task_root = Path(lm_eval.__file__).parent / "tasks"
     manager = TaskManager(
         include_defaults=False,
-        include_path=[str(task_root / name) for name in TASKS]
+        include_path=[str(task_root / name) for name in TASKS if name != "mbpp"]
         + [str(Path(__file__).parent / "tasks")],
     )
     scores = (
@@ -100,7 +112,7 @@ def evaluate(args):
             model_args=model_args,
             tasks=[run_task],
             num_fewshot=TASKS[task],
-            batch_size=args.batch_size,
+            batch_size=args.batch_size or BATCH[config.model_type][task],
             device=args.device,
             limit=args.limit,
             log_samples=True,
@@ -124,8 +136,8 @@ def evaluate(args):
         scores[task] = metric(result, task)
         (root / "scores.json").write_text(json.dumps(scores, indent=2))
         print(json.dumps({task: scores[task]}), flush=True)
-    if len(scores) == len(TASKS):
-        scores["average"] = sum(scores.values()) / len(scores)
+    if all(task in scores for task in TASKS):
+        scores["average"] = sum(scores[task] for task in TASKS) / len(TASKS)
     (root / "scores.json").write_text(json.dumps(scores, indent=2))
     (root / "cache_stats.json").write_text(
         json.dumps(cache.get_transformers_mla_kv_quant_stats(), indent=2)
@@ -141,15 +153,22 @@ def main():
     parser.add_argument("--tasks", nargs="+", choices=tuple(TASKS), default=list(TASKS))
     parser.add_argument("--window", choices=tuple(WINDOWS), default="s4r16")
     parser.add_argument("--output", required=True)
-    parser.add_argument("--batch-size", type=int, default=16)
+    parser.add_argument(
+        "--batch-size", type=int, help="override the per-model, per-task paper batch"
+    )
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--attention-backend", default="flash_attention_2")
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--chat-template", action="store_true")
     parser.add_argument("--cmmlu-data", help="optional local CMMLU dev/ and test/ CSV directory")
-    parser.add_argument("--limit", type=int, help="partial evaluation; omit for the main table")
+    parser.add_argument("--limit", type=int, help="evaluate a subset of each task")
     parser.add_argument("--resume", action="store_true")
-    evaluate(parser.parse_args())
+    args = parser.parse_args()
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("batch-size must be positive")
+    if args.limit is not None and args.limit < 1:
+        parser.error("limit must be positive")
+    evaluate(args)
 
 
 if __name__ == "__main__":

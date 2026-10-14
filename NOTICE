@@ -12,7 +12,9 @@ KVarN
   https://arxiv.org/abs/2606.03458
   Local PyTorch adaptation in mla_quant/cache.py; content-latent cache semantics
   differ from separate expanded K/V tensors.
-  Upstream license: Apache-2.0; retained in licenses/Apache-2.0.txt.
+  Upstream copyright: Huawei (2026), as stated in the upstream license.
+  License: Apache-2.0; the unmodified upstream text is retained in
+  licenses/KVarN-Apache-2.0.txt. This attribution refers to the dependency.
 
 RULER
   https://github.com/NVIDIA/RULER
@@ -25,3 +27,17 @@ lm-evaluation-harness
   https://github.com/EleutherAI/lm-evaluation-harness
   License: MIT; retained in licenses/lm-eval-MIT.txt.
   The HumanEval instruction adapter follows the upstream evaluation protocol.
+  The MBPP adapter retains the upstream prompt and examples, with both literal
+  [DONE] and [END] stopping markers.
+
+SGLang / OSCAR native serving
+  https://github.com/sgl-project/sglang
+  https://github.com/FutureMLS-Lab/OSCAR
+  Pinned OSCAR source: 19f85e13059de3da60686af4cbdd778b5671d9ff.
+  SGLang is licensed under Apache-2.0; OSCAR additions under MIT.
+  deployment/patches/rolaq_sglang.patch modifies the packed MLA cache writer,
+  reader integration, rotation folding, and cache accounting. The RoLaQ
+  parameter loader and fused writer are in deployment/sglang/.
+  Upstream source is fetched separately.
+  The applicable license texts are retained in licenses/Apache-2.0.txt and
+  licenses/OSCAR-MIT.txt; existing upstream copyright notices remain intact.

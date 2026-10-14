@@ -4,7 +4,6 @@ from __future__ import annotations
 import functools
 import importlib
 import inspect
-import os
 import warnings
 from collections.abc import Callable, Iterable
 from typing import Any
@@ -119,17 +118,6 @@ def take_pending_pad_mask(tokens: int | None = None) -> torch.Tensor | None:
     return max(masks, key=lambda item: item.shape[1])
 
 
-def pad_fix_enabled() -> bool:
-    """Whether padding is excluded from tile statistics.
-
-    ``KVARN_LEGACY_PAD_STATS=1`` restores the historical behaviour where pad
-    rows were part of a chunk's statistics. It gates *both* mask sources — the
-    lm-eval adapter (loglikelihood) and the attention mask (generation) — so a
-    legacy rerun really is the old numerical path and not a half-fixed one.
-    """
-    return str(os.environ.get("KVARN_LEGACY_PAD_STATS", "")).lower() not in {"1", "true", "yes"}
-
-
 class FakeIntQuantizer:
     """Per-token, group-wise affine min-max fake quantizer.
 
@@ -203,7 +191,7 @@ class FakeIntQuantizer:
         Row ``i`` of the result equals ``self(rows[i : i + 1])`` bit for bit.
         The sliding window uses this to quantize, in one go, the rows that
         leave the recent window during a decode step (at most one per batch
-        element) without changing the numerics of the historical per-row
+        element) without changing the numerics of the per-row
         calls.  Affine INT only uses exact min/max reductions and elementwise
         ops, so one batched call is exact per row.  The other INT2 modes reduce
         means/stds whose CUDA reduction order may depend on the batch shape, so
@@ -446,10 +434,9 @@ class KVarNFakeQuantizer(FakeIntQuantizer):
                 torch.matmul(restored, hadamard.transpose(0, 1)).reshape(tile.shape).to(tile.dtype)
             )
         rotated = torch.matmul(flat, hadamard).transpose(1, 2).contiguous()
-        sinkhorn_iterations = self.sinkhorn_iterations
-        if os.environ.get("KVARN_SKIP_SINKHORN"):
-            sinkhorn_iterations = 0
-        balanced, s_col, s_row = _kvarn_variance_normalize(rotated, iterations=sinkhorn_iterations)
+        balanced, s_col, s_row = _kvarn_variance_normalize(
+            rotated, iterations=self.sinkhorn_iterations
+        )
         minimum = balanced.amin(dim=-1, keepdim=True)
         maximum = balanced.amax(dim=-1, keepdim=True)
         scale = (maximum - minimum) / self.qmax
@@ -537,16 +524,8 @@ class KVarNFakeQuantizer(FakeIntQuantizer):
         return output
 
     def _quantize_plain(self, tensor: torch.Tensor, hadamard: torch.Tensor) -> torch.Tensor:
-        """The historical behaviour: chunk every row, padding included."""
+        """Quantize consecutive token tiles; the masked path separates padding."""
         tokens = tensor.shape[-2]
-        if os.environ.get("KVARN_FORCE_PER_TOKEN"):
-            return torch.cat(
-                [
-                    self._quantize_tile(tensor[..., index : index + 1, :], hadamard)
-                    for index in range(tokens)
-                ],
-                dim=-2,
-            )
         chunk = self.group_size
         n_full = tokens // chunk
         chunks = []
@@ -556,11 +535,7 @@ class KVarNFakeQuantizer(FakeIntQuantizer):
             )
         for start in range(n_full * chunk, tokens, chunk):
             end = min(start + chunk, tokens)
-            if (
-                end - start < self.group_size
-                and self.partial == "per-token"
-                and (not os.environ.get("KVARN_SKIP_PARTIAL_TILES"))
-            ):
+            if end - start < self.group_size and self.partial == "per-token":
                 chunks.append(
                     torch.cat(
                         [
@@ -571,10 +546,7 @@ class KVarNFakeQuantizer(FakeIntQuantizer):
                     )
                 )
                 continue
-            if end - start < self.group_size and os.environ.get("KVARN_SKIP_PARTIAL_TILES"):
-                chunks.append(tensor[..., start:end, :].clone())
-            else:
-                chunks.append(self._quantize_tile(tensor[..., start:end, :], hadamard))
+            chunks.append(self._quantize_tile(tensor[..., start:end, :], hadamard))
         return chunks[0] if len(chunks) == 1 else torch.cat(chunks, dim=-2)
 
     _MAX_TILES_PER_CALL = 512
@@ -585,7 +557,7 @@ class KVarNFakeQuantizer(FakeIntQuantizer):
         """``_quantize_tile`` on every full ``group_size`` chunk, batched.
 
         Bitwise equal to calling ``_quantize_tile`` once per chunk (the
-        historical loop).  The two rotation matmuls stay one call per chunk
+        per-row loop).  The two rotation matmuls stay one call per chunk
         with the same ``M = rows * group_size`` as before, because a matmul
         over all chunks would pick another cuBLAS kernel and round
         differently.  Sinkhorn, min/max and the affine QDQ are per tile, so
@@ -596,9 +568,6 @@ class KVarNFakeQuantizer(FakeIntQuantizer):
         chunk = self.group_size
         lead = tensor.shape[:-2]
         rows = tensor[..., :1, :1].numel()
-        sinkhorn_iterations = self.sinkhorn_iterations
-        if os.environ.get("KVARN_SKIP_SINKHORN"):
-            sinkhorn_iterations = 0
         inverse = hadamard.transpose(0, 1)
         chunks_per_call = max(1, self._MAX_TILES_PER_CALL // max(rows, 1))
         restored_parts = []
@@ -619,7 +588,7 @@ class KVarNFakeQuantizer(FakeIntQuantizer):
             )
             count = last - first
             balanced, s_col, s_row = _kvarn_variance_normalize(
-                rotated.reshape(count * rows, width, chunk), iterations=sinkhorn_iterations
+                rotated.reshape(count * rows, width, chunk), iterations=self.sinkhorn_iterations
             )
             minimum = balanced.amin(dim=-1, keepdim=True)
             maximum = balanced.amax(dim=-1, keepdim=True)
@@ -646,16 +615,7 @@ class KVarNFakeQuantizer(FakeIntQuantizer):
         return restored.reshape(*lead, n_full * chunk, width).to(tensor.dtype)
 
     def __call__(self, tensor: torch.Tensor, valid: torch.Tensor | None = None) -> torch.Tensor:
-        if os.environ.get("KVARN_SKIP_DECODE_QUANT") and tensor.shape[-2] == 1:
-            return tensor.clone()
         return self.quantize_full_tiles(tensor, valid=valid)
-
-    _DIAGNOSTIC_ENV_FLAGS = (
-        "KVARN_SKIP_DECODE_QUANT",
-        "KVARN_FORCE_PER_TOKEN",
-        "KVARN_SKIP_PARTIAL_TILES",
-        "KVARN_SKIP_SINKHORN",
-    )
 
     def quantize_rows(self, rows: torch.Tensor) -> torch.Tensor:
         """QDQ independent one-token rows ``[N, ..., 1, R]``, exact per row.
@@ -673,7 +633,7 @@ class KVarNFakeQuantizer(FakeIntQuantizer):
         count, tokens, width = (rows.shape[0], rows.shape[-2], rows.shape[-1])
         if count == 0:
             return rows.clone()
-        if tokens != 1 or any((os.environ.get(flag) for flag in self._DIAGNOSTIC_ENV_FLAGS)):
+        if tokens != 1:
             return torch.cat(
                 [
                     self(
@@ -772,8 +732,6 @@ class FakeQuantizedDynamicCache(DynamicCache):
 
     def set_pad_mask(self, mask: torch.Tensor | None) -> None:
         """Tell the cache which rows of the next update are padding."""
-        if not pad_fix_enabled():
-            mask = None
         self._pad_mask = None if mask is None else mask.to("cpu", torch.bool)
         self._row_cache_key = None
         self._row_cache = None
@@ -973,7 +931,7 @@ class FakeQuantizedDynamicCache(DynamicCache):
         The token of each row is gathered with a device-side index (rows with
         no transition gather a dummy token whose QDQ result is discarded), so
         there is no per-row ``nonzero`` host sync.  ``quantize_rows`` is exact
-        per row, so the cache matches the historical per-row loop bit for bit.
+        per row, so the cache matches the per-row computation bit for bit.
         """
         batch = tensor.shape[0]
         has = transition.any(dim=-1)

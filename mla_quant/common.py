@@ -12,7 +12,7 @@ MODEL_IDS = {
     "moonlight": "moonshotai/Moonlight-16B-A3B",
     "minicpm": "openbmb/MiniCPM3-4B",
 }
-METHODS = ("bf16", "int2", "h128", "kvarn", "oscar", "ours")
+METHODS = ("bf16", "int2", "h128", "kvarn", "oscar", "rolaq", "ours")
 WINDOWS = {"nowin": (0, 0), "s4r8": (4, 8), "s4r16": (4, 16)}
 
 
@@ -38,8 +38,13 @@ def install_method(method, model_type, artifact=None, window="nowin"):
     if method == "bf16":
         return
     sink, recent = WINDOWS[window]
-    native = {"int2": "naive", "h128": "quarot", "ours": "learned_rotation"}.get(method, method)
-    if method in ("oscar", "ours") and not artifact:
+    native = {
+        "int2": "naive",
+        "h128": "quarot",
+        "rolaq": "learned_rotation",
+        "ours": "learned_rotation",
+    }.get(method, method)
+    if method in ("oscar", "rolaq", "ours") and not artifact:
         raise ValueError(f"{method} needs --artifact")
     cache.patch_transformers_mla_kv_cache(
         method=native,

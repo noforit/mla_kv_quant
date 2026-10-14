@@ -87,8 +87,24 @@ def batches(views, budget, tokens_per_update, seed):
         used += view.input_tokens
     if current:
         result.append(current)
+    if used != budget:
+        raise ValueError(f"training data contains {used} input tokens; requested {budget}")
     random.Random(seed).shuffle(result)
     return result
+
+
+def source_records(args):
+    if args.input_jsonl:
+        with Path(args.input_jsonl).open() as handle:
+            for line in handle:
+                if line.strip():
+                    yield json.loads(line)
+    else:
+        from datasets import load_dataset
+
+        yield from load_dataset(
+            args.dataset, split="train", revision=args.dataset_revision, streaming=True
+        )
 
 
 def prepare(args):
@@ -100,42 +116,38 @@ def prepare(args):
     rng = random.Random(args.seed)
     splits = {"rotation": [], "validation": [], "train": []}
     seen, used = set(), 0
-    with Path(args.input_jsonl).open() as handle:
-        for line in handle:
-            if not line.strip():
-                continue
-            row = json.loads(line)
-            text = str(row.get("text", "")).strip()
-            source = hashlib.sha256(text.encode()).hexdigest()
-            if not text or source in seen:
-                continue
-            if len(splits["rotation"]) < args.rotation_docs:
-                split, length = "rotation", args.rotation_length
-            elif len(splits["validation"]) < args.validation_docs:
-                split, length = "validation", 512
-            else:
-                split = "train"
-                # Approximate 20/40/40 token proportions at lengths 512/2048/4096.
-                length = rng.choices((512, 2048, 4096), weights=(4, 2, 1))[0]
-                length = min(length, args.input_token_budget - used)
-            ids = tokenizer(text, truncation=True, max_length=length + 1, add_special_tokens=True)[
-                "input_ids"
-            ]
-            if len(ids) < length + 1:
-                continue
-            seen.add(source)
-            record = {
-                "label": f"{split}_{len(splits[split])}",
-                "token_ids": ids,
-                "source_sha256": source,
-                "token_sha256": digest_json(ids),
-                "domain": row.get("domain", row.get("meta", {}).get("pile_set_name", "corpus")),
-            }
-            splits[split].append(record)
-            if split == "train":
-                used += len(ids) - 1
-                if used >= args.input_token_budget:
-                    break
+    for row in source_records(args):
+        text = str(row.get("text", "")).strip()
+        source = hashlib.sha256(text.encode()).hexdigest()
+        if not text or source in seen:
+            continue
+        if len(splits["rotation"]) < args.rotation_docs:
+            split, length = "rotation", args.rotation_length
+        elif len(splits["validation"]) < args.validation_docs:
+            split, length = "validation", 512
+        else:
+            split = "train"
+            # Approximate 20/40/40 token proportions at lengths 512/2048/4096.
+            length = rng.choices((512, 2048, 4096), weights=(4, 2, 1))[0]
+            length = min(length, args.input_token_budget - used)
+        ids = tokenizer(text, truncation=True, max_length=length + 1, add_special_tokens=True)[
+            "input_ids"
+        ]
+        if len(ids) < length + 1:
+            continue
+        seen.add(source)
+        record = {
+            "label": f"{split}_{len(splits[split])}",
+            "token_ids": ids,
+            "source_sha256": source,
+            "token_sha256": digest_json(ids),
+            "domain": row.get("domain", row.get("meta", {}).get("pile_set_name", "corpus")),
+        }
+        splits[split].append(record)
+        if split == "train":
+            used += len(ids) - 1
+            if used >= args.input_token_budget:
+                break
     if used < args.input_token_budget or len(splits["validation"]) != args.validation_docs:
         raise ValueError("insufficient distinct long documents for the requested splits")
     for split, records in splits.items():
@@ -156,7 +168,12 @@ def prepare(args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--input-jsonl", required=True, help="JSONL with text and optional domain")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input-jsonl", help="JSONL with text and optional domain")
+    source.add_argument(
+        "--dataset", help="Hugging Face text dataset, streamed from its train split"
+    )
+    parser.add_argument("--dataset-revision", help="pin the dataset commit for reproducibility")
     parser.add_argument("--output", required=True)
     parser.add_argument("--seed", type=int, default=20260923)
     parser.add_argument("--input-token-budget", type=int, default=1430800)

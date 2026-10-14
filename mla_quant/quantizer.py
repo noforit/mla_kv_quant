@@ -20,7 +20,6 @@ from .oscar import (
 
 FORMAT_VERSION = 2
 RECIPE = "learned_shared_latent_rotation_quantizer_v2"
-LEGACY_RECIPE = "learned_shared_latent_rotation_quantizer_v1"
 GRADIENT_RECIPE = "affine_full_round_ste_lloyd_hard_gain_ordered_soft_threshold_v2"
 NUMERICS = "fp32_rotation_bf16_roundtrip_fp32_qdq_input_dtype_roundtrip_fp32_inverse_input_dtype"
 OSCAR_LLOYD_INIT = (float(LLOYD_MAX_THRESHOLDS[-1]), float(LLOYD_MAX_STRETCH))
@@ -134,32 +133,6 @@ def skew_exp_rotation(base: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
     return base.float() @ delta
 
 
-def skew_cayley_rotation(base: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
-    """Cayley transform of a skew-symmetric matrix: exactly orthogonal.
-
-    ``R = (I - A) (I + A)^{-1}`` with ``A = raw - raw.T``.  The transpose is
-    solved directly so the forward only needs one linear solve, and the
-    result is orthogonal by construction for any finite skew ``A``.
-    """
-    skew = (raw - raw.T).float()
-    identity = torch.eye(skew.shape[-1], device=skew.device, dtype=torch.float32)
-    left = (identity + skew).transpose(-1, -2)
-    right = (identity - skew).transpose(-1, -2)
-    delta = torch.linalg.solve(left, right).transpose(-1, -2)
-    return base.float() @ delta
-
-
-def project_quant_params(family: str, first: torch.Tensor, second: torch.Tensor) -> None:
-    if family not in QUANT_FAMILIES:
-        raise ValueError(f"unknown quant family {family!r}")
-    if not torch.isfinite(first).all() or not torch.isfinite(second).all():
-        raise ValueError("non-finite quantizer parameters")
-    bounds = LLOYD_BOUNDS
-    with torch.no_grad():
-        first.clamp_(*bounds[0])
-        second.clamp_(*bounds[1])
-
-
 def _validate_parameters(family, first, second):
     if family not in QUANT_FAMILIES:
         raise ValueError(f"unknown quant family {family!r}")
@@ -201,8 +174,8 @@ def write_learned_artifact(
     expected = set(range(int(identity["num_hidden_layers"])))
     if set(rotations) != expected or set(params) != expected:
         raise ValueError("learned artifact must contain every layer")
-    if train_part not in ("rotation", "quantizer", "joint"):
-        raise ValueError("unknown train part")
+    if train_part != "joint":
+        raise ValueError("RoLaQ jointly calibrates rotation and range")
     if not math.isfinite(mla_output_weight) or mla_output_weight < 0:
         raise ValueError("MLA output weight must be finite and nonnegative")
     for layer in expected:
@@ -232,7 +205,7 @@ def write_learned_artifact(
         "components": ["nope"],
         "windows": False,
         "model": identity,
-        "base_rotation_dir": str(Path(base_rotation_dir).resolve()),
+        "base_rotation_manifest_sha256": sha256_file(Path(base_rotation_dir) / "manifest.json"),
         "layers": layers,
         "calibration": calibration,
         "builder_sha256": sha256_file(__file__),
@@ -250,9 +223,9 @@ class LearnedRotationQuantizer:
         path = self.root / "manifest.json"
         self.manifest = json.loads(path.read_text())
         self.manifest_sha256 = sha256_file(path)
-        if (self.manifest.get("format_version"), self.manifest.get("recipe")) not in (
-            (FORMAT_VERSION, RECIPE),
-            (1, LEGACY_RECIPE),
+        if (self.manifest.get("format_version"), self.manifest.get("recipe")) != (
+            FORMAT_VERSION,
+            RECIPE,
         ):
             raise ValueError("not a learned rotation artifact")
         if self.manifest.get("numerics") != NUMERICS:
